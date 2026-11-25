@@ -1,0 +1,129 @@
+name: MRR version previews
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if source commits are unchanged
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mrr-preview-pages
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      changed: ${{ steps.plan.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: plan
+        env:
+          FORCE_BUILD: ${{ github.event_name == 'push' || inputs.force == true }}
+        run: python3 scripts/plan.py
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      MRR_GIT_COMMIT: ${{ matrix.sha }}
+      PREVIEW_VERSION: ${{ matrix.version }}
+      PREVIEW_BASE: /MRR-preview/${{ matrix.version }}/
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: weepwood/MRR
+          ref: ${{ matrix.sha }}
+          path: source
+          persist-credentials: false
+      - name: Verify exact source
+        working-directory: source
+        run: test "$(git rev-parse HEAD)" = "$MRR_GIT_COMMIT"
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.33.0
+          package_json_file: source/frontend-fantastic-admin/package.json
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: source/frontend-fantastic-admin/.node-version
+          cache: pnpm
+          cache-dependency-path: source/frontend-fantastic-admin/pnpm-lock.yaml
+      - name: Build isolated static Mock
+        working-directory: source/frontend-fantastic-admin
+        run: |
+          pnpm install --frozen-lockfile
+          cp .env.pages.example .env.pages
+          export VITE_APP_TITLE="MRR ${PREVIEW_VERSION} 合成数据预览"
+          pnpm build:pages --base "$PREVIEW_BASE"
+      - name: Verify output and write identity
+        run: python3 scripts/assemble.py stamp source/frontend-fantastic-admin/dist-pages "$PREVIEW_VERSION" "$MRR_GIT_COMMIT"
+      - name: Install Chromium
+        working-directory: source/frontend-fantastic-admin
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Browser verify built assets
+        run: |
+          cp scripts/verify.mjs source/frontend-fantastic-admin/e2e/preview-verify.mjs
+          cd source/frontend-fantastic-admin
+          node e2e/preview-verify.mjs
+      - uses: actions/upload-artifact@v7
+        with:
+          name: preview-${{ matrix.version }}
+          path: source/frontend-fantastic-admin/dist-pages/
+          if-no-files-found: error
+          retention-days: 2
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: preview-*
+          path: downloaded
+      - name: Assemble verified versions
+        env:
+          EXPECTED_MATRIX: ${{ needs.plan.outputs.matrix }}
+        run: python3 scripts/assemble.py site downloaded site
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - name: Deploy only the separate preview repository
+        id: deployment
+        uses: actions/deploy-pages@v5
+      - name: Check online identities
+        env:
+          EXPECTED_MATRIX: ${{ needs.plan.outputs.matrix }}
+        run: python3 scripts/assemble.py online
