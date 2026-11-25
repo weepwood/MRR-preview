@@ -101,6 +101,7 @@ jobs:
       contents: read
       pages: write
       id-token: write
+      actions: read
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -121,6 +122,19 @@ jobs:
         with:
           name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
           path: site
+      - name: Wait for the exact Pages artifact to become visible
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_NAME: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          for attempt in $(seq 1 30); do
+            count=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.artifacts[] | select(.name == env.ARTIFACT_NAME and .expired == false and .size_in_bytes > 0) | .id' | wc -l)
+            if [ "$count" -eq 1 ]; then exit 0; fi
+            echo "Waiting for exact artifact metadata: $attempt/30 (count=$count)"
+            sleep 5
+          done
+          echo 'Exact artifact metadata not available; refusing to deploy.' >&2
+          exit 1
       - name: Deploy only the separate preview repository
         id: deployment
         uses: actions/deploy-pages@v5
