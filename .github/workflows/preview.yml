@@ -96,7 +96,7 @@ jobs:
     needs: [plan, build]
     if: needs.plan.outputs.changed == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
       pages: write
@@ -119,10 +119,13 @@ jobs:
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
+          name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
           path: site
       - name: Deploy only the separate preview repository
         id: deployment
         uses: actions/deploy-pages@v5
+        with:
+          artifact_name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Check online identities
         env:
           EXPECTED_MATRIX: ${{ needs.plan.outputs.matrix }}
