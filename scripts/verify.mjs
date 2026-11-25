@@ -10,6 +10,10 @@ assert.equal(base, '/MRR-preview/' + version + '/')
 const live = process.env.PREVIEW_LIVE === 'true'
 const app = live ? 'https://weepwood.github.io' + base : 'http://127.0.0.1:4178' + base
 const server = live ? null : await preview({ mode: 'pages', base, preview: { host: '127.0.0.1', port: 4178, strictPort: true } })
+const receivedApi = []
+server?.httpServer.prependListener('request', request => {
+  if (/^\/proxy\/|\/api\/v1\//.test(request.url || '')) receivedApi.push(request.url)
+})
 let browser
 try {
   const res = await fetch(app + 'preview-build.json')
@@ -20,10 +24,17 @@ try {
   assert.match(html, /connect-src (?:&#39;|&apos;|')none(?:&#39;|&apos;|')/)
   browser = await chromium.launch({ headless: true })
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } })
-  const errors = [], outbound = []
+  const errors = [], attempts = [], apiResponses = []
+  const isApi = request => /^https?:/.test(request.url()) && /\/proxy\/|\/api\/v1\//.test(new URL(request.url()).pathname)
   page.on('pageerror', error => errors.push(error.message))
-  page.on('request', request => {
-    if (/^https?:/.test(request.url()) && /\/proxy\/|\/api\/v1\//.test(new URL(request.url()).pathname)) outbound.push(request.url())
+  page.on('request', request => { if (isApi(request)) attempts.push(request) })
+  page.on('response', response => { if (isApi(response.request())) apiResponses.push(response.url()) })
+  const cdp = await page.context().newCDPSession(page)
+  const networkRequests = new Map(), cspBlocked = new Set()
+  await cdp.send('Network.enable')
+  cdp.on('Network.requestWillBeSent', event => networkRequests.set(event.requestId, event.request.url))
+  cdp.on('Network.loadingFailed', event => {
+    if (event.blockedReason === 'csp') cspBlocked.add(networkRequests.get(event.requestId))
   })
   await page.goto(app + '#/archive-workbench', { waitUntil: 'domcontentloaded' })
   const search = page.getByRole('textbox', { name: '病案查询值' })
@@ -58,7 +69,17 @@ try {
   await search.waitFor({ timeout: 45_000 })
   const denied = await page.evaluate(async () => (await fetch('/proxy/api/v1/patients/1', { method: 'PUT' })).json())
   assert.equal(denied.code, 503)
-  assert.deepEqual(outbound, [], 'no real API traffic')
+  assert.deepEqual(receivedApi, [], 'no API traffic reached the static server')
+  assert.deepEqual(apiResponses, [], 'no API network responses')
+  for (const request of attempts) {
+    const url = new URL(request.url())
+    assert.equal(url.origin, new URL(app).origin)
+    assert.equal(url.pathname, '/proxy/api/v1/public/status/developer-mode', 'unexpected network attempt')
+    assert.equal(request.method(), 'GET')
+    assert.ok(request.failure(), 'status request must fail locally')
+    assert.ok(cspBlocked.has(request.url()) || /CSP/i.test(request.failure().errorText), 'status request must be blocked by CSP')
+  }
+  console.log('CSP-blocked read-only status probes:', attempts.length, '; server received API traffic:', receivedApi.length)
   assert.deepEqual(errors, [], 'no unhandled browser errors')
   console.log('PASS: ' + version + ' ' + sha + ' ' + app + '#/archive-workbench')
 } finally {
